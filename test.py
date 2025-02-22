@@ -62,6 +62,7 @@ def test_expiry_behavior():
 
 if __name__ == "__main__":
     test_set_key()
+    test_get_key()
     test_expiry_behavior()
 
     print("\n[🗑️] Testing key deletion:")
