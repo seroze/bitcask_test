@@ -13,3 +13,4 @@
 - implement raft over wal (for fault tolerance)
 - support batch writes for performance
 - introduce snapshotting
+- implement an SQL frontend
