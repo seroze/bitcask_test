@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -22,7 +27,7 @@ del(key)
 **/
 
 type Record struct {
-	crc       int8
+	crc       uint32
 	expiry    int64
 	keySize   int64
 	key       string
@@ -147,26 +152,27 @@ func encodeRecord(key string, val string, expiry int64) []byte {
 	valSize := int64(len(val))
 
 	// Calculate total record length
-	recordLen := 1 + 8 + 8 + 8 + keySize + valSize
+	recordLen := 4 + 8 + 8 + 8 + keySize + valSize
 	record := make([]byte, recordLen)
 
-	// Setting a dummy CRC for now (1 byte)
-	record[0] = 0
-
 	// Encode expiry (8 bytes)
-	binary.LittleEndian.PutUint64(record[1:9], uint64(expiry))
+	binary.LittleEndian.PutUint64(record[4:12], uint64(expiry))
 
 	// Encode key size (8 bytes)
-	binary.LittleEndian.PutUint64(record[9:17], uint64(keySize))
+	binary.LittleEndian.PutUint64(record[12:20], uint64(keySize))
 
 	// Encode value size (8 bytes)
-	binary.LittleEndian.PutUint64(record[17:25], uint64(valSize))
+	binary.LittleEndian.PutUint64(record[20:28], uint64(valSize))
 
 	// Copy key bytes
-	copy(record[25:25+keySize], key)
+	copy(record[28:28+keySize], key)
 
 	// Copy value bytes
-	copy(record[25+keySize:], val)
+	copy(record[28+keySize:], val)
+
+	// Compute checksum (excluding first 4 bytes, where checksum is stored)
+	checksum := crc32.ChecksumIEEE(record[4:])
+	binary.LittleEndian.PutUint32(record[:4], checksum) // Store checksum at the beginning
 
 	return record
 }
@@ -205,18 +211,19 @@ func (fs *FileStore) Get(offset int64) (string, int64, error) {
 
 func decodeRecord(file *os.File) (*Record, error) {
 
-	header := make([]byte, 1+8+8+8)
+	header := make([]byte, 4+8+8+8)
 	// loads the file contents to byte slice till it's full
 	_, err := file.Read(header)
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract fields from the header
-	crc := int8(header[0])
-	expiry := int64(binary.LittleEndian.Uint64(header[1:9]))
-	keySize := int64(binary.LittleEndian.Uint64(header[9:17]))
-	valueSize := int64(binary.LittleEndian.Uint64(header[17:25]))
+	// Extract checksum
+	storedChecksum := binary.LittleEndian.Uint32(header[:4])
+
+	expiry := int64(binary.LittleEndian.Uint64(header[4:12]))
+	keySize := int64(binary.LittleEndian.Uint64(header[12:20]))
+	valueSize := int64(binary.LittleEndian.Uint64(header[20:28]))
 
 	// Read the key
 	keyBytes := make([]byte, keySize)
@@ -234,9 +241,19 @@ func decodeRecord(file *os.File) (*Record, error) {
 	}
 	val := string(valBytes)
 
+	// Recalculate checksum for validation
+	fullRecord := append(header[4:], keyBytes...)
+	fullRecord = append(fullRecord, valBytes...)
+	calculatedChecksum := crc32.ChecksumIEEE(fullRecord)
+
+	// Validate checksum
+	if storedChecksum != calculatedChecksum {
+		return nil, errors.New("checksum mismatch: data may be corrupted")
+	}
+
 	// Construct and return the decoded record
 	return &Record{
-		crc:       crc,
+		crc:       storedChecksum,
 		expiry:    expiry,
 		keySize:   keySize,
 		key:       key,
@@ -419,12 +436,55 @@ func main() {
 	storage, err = NewBitcaskStorage("bitcask_wal.file", "bitcask_db.file")
 	if err != nil {
 		fmt.Println("Problem initializing bitcask storage")
+		os.Exit(1)
 	}
+
+	// http.HandleFunc("/rpc/hello", HelloHandler)
+	// http.HandleFunc("/rpc/set", setKeyValHandler)
+	// http.HandleFunc("/rpc/get", getKeyHandler)
+	// http.HandleFunc("/rpc/delete", deleteKeyValHandler)
+
+	// http.ListenAndServe(":8080", nil)
+
+	// Create an HTTP server
+	server := &http.Server{Addr: ":8080"}
 
 	http.HandleFunc("/rpc/hello", HelloHandler)
 	http.HandleFunc("/rpc/set", setKeyValHandler)
 	http.HandleFunc("/rpc/get", getKeyHandler)
 	http.HandleFunc("/rpc/delete", deleteKeyValHandler)
 
-	http.ListenAndServe(":8080", nil)
+	// Channel to listen for OS signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Run the HTTP server in a goroutine
+	go func() {
+		fmt.Println("Server is running on port 8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("ListenAndServe Error: %v\n", err)
+		}
+	}()
+
+	// Wait for a shutdown signal
+	<-stop
+	fmt.Println("Shutting down server...")
+
+	// Create a context with timeout to allow graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Shut down HTTP server
+	if err := server.Shutdown(ctx); err != nil {
+		fmt.Printf("Server Shutdown Error: %v\n", err)
+	}
+
+	// Close storage files
+	if bitcaskStorage, ok := storage.(*BitcaskStorage); ok {
+		fmt.Println("Closing storage files...")
+		bitcaskStorage.fileStore.Close()
+		bitcaskStorage.wal.Close()
+	}
+
+	fmt.Println("Shutdown complete")
 }
