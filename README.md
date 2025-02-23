@@ -8,10 +8,10 @@
   - ✅ implement delete
   - ✅ implement crc
 - ✅ handle shutdown gracefully
-- discard expired entries (aka compaction)
+- ✅ discard expired entries (aka compaction)
 - implement wal
+- implement snapshotting
 - implement raft over wal (for fault tolerance)
 - support batch writes for performance
-- introduce snapshotting
 - benchmark performance
 - implement an SQL frontend

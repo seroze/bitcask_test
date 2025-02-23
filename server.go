@@ -102,6 +102,72 @@ func (bs *BitcaskStorage) Delete(key string) error {
 	return nil
 }
 
+func (bs *BitcaskStorage) Compact() error {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+
+	fmt.Println("Starting compaction process...")
+
+	// Define a new compacted file
+	tempFileName := "bitcask_db_compact.file"
+	tempFile, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create compaction file: %w", err)
+	}
+	defer tempFile.Close()
+
+	newIndex := make(map[string]int64)
+
+	// Iterate through index and copy valid records
+	for key, offset := range bs.index {
+		val, expiry, err := bs.fileStore.Get(offset)
+		if err != nil || time.Now().Unix() > expiry {
+			// Skip expired or corrupted records
+			continue
+		}
+
+		newOffset, err := bs.fileStore.appendToFile(tempFile, key, val, expiry)
+		if err != nil {
+			return fmt.Errorf("failed to write compacted data: %w", err)
+		}
+
+		newIndex[key] = newOffset
+	}
+
+	// Close the old file
+	bs.fileStore.dataFile.Close()
+
+	// Replace old database file with compacted file
+	err = os.Rename(tempFileName, "bitcask_db.file")
+	if err != nil {
+		return fmt.Errorf("failed to replace old database file: %w", err)
+	}
+
+	// Reopen the new compacted file
+	bs.fileStore.dataFile, err = os.OpenFile("bitcask_db.file", os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to reopen compacted database file: %w", err)
+	}
+
+	// Update the index with new offsets
+	bs.index = newIndex
+
+	fmt.Println("Compaction completed successfully!")
+	return nil
+}
+
+func startCompactionRoutine(bs *BitcaskStorage, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			err := bs.Compact()
+			if err != nil {
+				fmt.Printf("Compaction failed: %v\n", err)
+			}
+		}
+	}()
+}
+
 //------------------------ File Store ------------------------
 
 type FileStore struct {
@@ -119,6 +185,35 @@ func NewFileStore(dataFileName string) (*FileStore, error) {
 	return &FileStore{
 		dataFile: file,
 	}, nil
+}
+
+func (fs *FileStore) appendToFile(file *os.File, key string, value string, expiry int64) (int64, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Encode the key-value record in Bitcask format
+	record := encodeRecord(key, value, expiry)
+
+	// Get the current offset before writing
+	offset, err := file.Seek(0, os.SEEK_END)
+	if err != nil {
+		return -1, fmt.Errorf("failed to seek end of file: %w", err)
+	}
+
+	// Write the record to file
+	_, err = file.Write(record)
+	if err != nil {
+		return -1, fmt.Errorf("failed to write record: %w", err)
+	}
+
+	// Ensure the data is physically written to disk
+	err = file.Sync()
+	if err != nil {
+		return -1, fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Return the offset where this record was written
+	return offset, nil
 }
 
 func (fs *FileStore) Set(key string, value string, expiry int64) (int64, error) {
@@ -434,17 +529,12 @@ func main() {
 	// storage = NewInMemoryStorage()
 	var err error
 	storage, err = NewBitcaskStorage("bitcask_wal.file", "bitcask_db.file")
+	startCompactionRoutine(storage.(*BitcaskStorage), 1*time.Minute)
+
 	if err != nil {
 		fmt.Println("Problem initializing bitcask storage")
 		os.Exit(1)
 	}
-
-	// http.HandleFunc("/rpc/hello", HelloHandler)
-	// http.HandleFunc("/rpc/set", setKeyValHandler)
-	// http.HandleFunc("/rpc/get", getKeyHandler)
-	// http.HandleFunc("/rpc/delete", deleteKeyValHandler)
-
-	// http.ListenAndServe(":8080", nil)
 
 	// Create an HTTP server
 	server := &http.Server{Addr: ":8080"}
