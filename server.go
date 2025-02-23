@@ -26,15 +26,6 @@ del(key)
 
 **/
 
-type Record struct {
-	crc       uint32
-	expiry    int64
-	keySize   int64
-	key       string
-	valueSize int64
-	value     string
-}
-
 type Response struct {
 	Message string `json:"message"`
 }
@@ -47,12 +38,20 @@ type Storage interface {
 	Delete(key string) error
 }
 
-//------------------------ BitcaskStorage ------------------------
+// ------------------------ BitcaskStorage ------------------------
+type Record struct {
+	crc       uint32
+	expiry    int64
+	keySize   int64
+	key       string
+	valueSize int64
+	value     string
+}
 
 type BitcaskStorage struct {
 	fileStore *FileStore       // fileStore
 	index     map[string]int64 //index
-	wal       *os.File         //write ahead log
+	wal       *WAL             //write ahead log
 	mu        sync.RWMutex
 }
 
@@ -80,7 +79,34 @@ func (bs *BitcaskStorage) Get(key string) (string, bool) {
 	return val, true
 }
 
+func computeCRC(record WalRecord) uint32 {
+	data := encodeWalRecord(record) // Serialize the record
+	return crc32.ChecksumIEEE(data)
+}
+
 func (bs *BitcaskStorage) Set(key string, val string, expiry int64) error {
+
+	// Write to WAL first
+	record := WalRecord{
+		CRC:       0, // Placeholder, should be computed based on record content
+		Timestamp: time.Now().UnixNano(),
+		KeySize:   int64(len(key)),
+		Key:       key,
+		ValueSize: int64(len(val)),
+		Value:     val,
+		OpType:    0x01, // 0x01 represents SET operation
+	}
+
+	// Compute CRC (you may use a proper checksum function here)
+	record.CRC = computeCRC(record)
+
+	// Encode record to binary format
+	data := encodeRecord(record.Key, record.Value, record.Timestamp)
+
+	// Write encoded data to WAL
+	if _, err := bs.wal.Write(data); err != nil {
+		return err
+	}
 
 	offset, err := bs.fileStore.Set(key, val, expiry)
 	if err != nil {
@@ -92,6 +118,29 @@ func (bs *BitcaskStorage) Set(key string, val string, expiry int64) error {
 }
 
 func (bs *BitcaskStorage) Delete(key string) error {
+
+	// Create WAL walRecord for DELETE operation
+	walRecord := WalRecord{
+		CRC:       0, // Placeholder, computed below
+		Timestamp: time.Now().UnixNano(),
+		KeySize:   int64(len(key)),
+		Key:       key,
+		ValueSize: 0,    // No value for DELETE
+		Value:     "",   // Empty value
+		OpType:    0x02, // 0x02 represents DELETE operation
+	}
+
+	// Compute CRC
+	walRecord.CRC = computeCRC(walRecord)
+
+	// Encode record to binary format
+	data := encodeRecord(walRecord.Key, walRecord.Value, walRecord.Timestamp)
+
+	// Write encoded data to WAL
+	if _, err := bs.wal.Write(data); err != nil {
+		return err
+	}
+
 	expiry := time.Now().Unix() - 100 // past even t
 	offset, err := bs.fileStore.Set(key, "", expiry)
 	if err != nil {
@@ -99,6 +148,23 @@ func (bs *BitcaskStorage) Delete(key string) error {
 		return err
 	}
 	bs.index[key] = offset
+	return nil
+}
+
+func (bs *BitcaskStorage) RecoverFromWAL(wal WAL) error {
+	fmt.Println("Recovering from WAL")
+	walRecords, err := wal.ReadAll()
+	if err != nil {
+		return err
+	}
+
+	for _, walRecord := range walRecords {
+		if walRecord.OpType == 0x01 { // SET operation
+			bs.Set(walRecord.Key, walRecord.Value, walRecord.Timestamp)
+		} else if walRecord.OpType == 0x02 { // DELETE operation
+			bs.Delete(walRecord.Key)
+		}
+	}
 	return nil
 }
 
@@ -361,6 +427,24 @@ func decodeRecord(file *os.File) (*Record, error) {
 
 func NewBitcaskStorage(walFilename string, dbFilename string) (*BitcaskStorage, error) {
 
+	if _, err := os.Stat(dbFilename); os.IsNotExist(err) {
+		fmt.Println("Data file missing. Recovering from WAL...")
+
+		// Create a WAL instance
+		wal, err := NewWAL(walFilename)
+		if err != nil {
+			fmt.Println("Failed to initialize WAL:", err)
+			return nil, nil
+		}
+
+		// Recover from WAL
+		err = storage.(*BitcaskStorage).RecoverFromWAL(wal)
+		if err != nil {
+			fmt.Println("WAL recovery failed:", err)
+			return nil, nil
+		}
+	}
+
 	walFile, err := os.OpenFile(walFilename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open WAL file: %w", err)
@@ -528,7 +612,20 @@ func main() {
 
 	// storage = NewInMemoryStorage()
 	var err error
-	storage, err = NewBitcaskStorage("bitcask_wal.file", "bitcask_db.file")
+
+	// Define file paths
+	dbFile := "bitcask_db.file"
+	walFile := "bitcask_wal.file"
+
+	// Initialize storage
+	storage, err = NewBitcaskStorage(walFile, dbFile)
+	if err != nil {
+		fmt.Println("Failed to initialize storage:", err)
+		return
+	}
+
+	fmt.Println("Storage initialized successfully")
+
 	startCompactionRoutine(storage.(*BitcaskStorage), 1*time.Minute)
 
 	if err != nil {

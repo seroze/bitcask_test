@@ -10,8 +10,7 @@
 - ✅ handle shutdown gracefully
 - ✅ discard expired entries (aka compaction)
 - implement wal
-- implement snapshotting
+- implement checkpointing (to stop the wal growing indefinetely)
+- support batch writes for performance (this has to be atomic, use wal)
 - implement raft over wal (for fault tolerance)
-- support batch writes for performance
 - benchmark performance
-- implement an SQL frontend
